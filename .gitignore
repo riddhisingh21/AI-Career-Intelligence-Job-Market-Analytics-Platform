@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local app state
+analysis_history.db
+*.db
+
+# Streamlit secrets and local config
+.streamlit/secrets.toml
+
+# Test/cache artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+
+# OS/editor
+.vscode/
+.DS_Store
+Thumbs.db
+
