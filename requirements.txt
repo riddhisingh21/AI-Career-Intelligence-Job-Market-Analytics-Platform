@@ -5,4 +5,3 @@ plotly==6.6.0
 pdfplumber==0.11.9
 sentence-transformers==5.2.3
 google-genai==1.66.0
-extra-streamlit-components==0.1.81

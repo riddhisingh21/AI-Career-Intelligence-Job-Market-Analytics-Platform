@@ -2,8 +2,9 @@ import json
 import streamlit as st
 import matplotlib.pyplot as plt
 import plotly.graph_objects as go
-import extra_streamlit_components as stx
-from datetime import datetime, timezone, timedelta
+import os
+import time
+import uuid
 from pathlib import Path
 
 from analyzer import (
@@ -64,51 +65,97 @@ from suggestions import (
 
 AUTH_USER_SESSION_KEY = "auth_user"
 SESSION_NOTICE_KEY = "session_notice"
-FIREBASE_SESSION_COOKIE = "firebase_session"
 
 
 # ---------------------------------------------------------------------------
-# Cookie-based session persistence helpers
+# Server-side session persistence
+# Session data (refresh token + identity) is stored in a JSON file next to
+# app.py. The session ID (a random UUID) is kept in st.query_params so it
+# survives page refreshes without any browser-cookie or component timing
+# issues. Sessions expire automatically after 30 days.
 # ---------------------------------------------------------------------------
 
-def _get_cookie_manager():
-    """Return the app-wide CookieManager instance (rendered once per run)."""
-    return stx.CookieManager(key="firebase_session_manager")
+_SESSION_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".sessions.json")
+_SESSION_PARAM = "_sid"
+_SESSION_TTL_SECONDS = 30 * 24 * 3600  # 30 days
 
 
-def _save_session_cookie(cookie_manager, auth_user):
-    """Persist the Firebase refresh token + identity info to a 30-day cookie."""
-    payload = json.dumps({
-        "rt": auth_user.get("refresh_token", ""),
-        "em": auth_user.get("email", ""),
-        "uid": auth_user.get("local_id", ""),
-    })
-    expires_at = datetime.now(timezone.utc) + timedelta(days=30)
-    cookie_manager.set(FIREBASE_SESSION_COOKIE, payload, expires_at=expires_at)
-
-
-def _delete_session_cookie(cookie_manager):
-    """Remove the Firebase session cookie (called on sign-out)."""
+def _load_all_sessions() -> dict:
+    """Read the on-disk session store; return {} on any error."""
     try:
-        cookie_manager.delete(FIREBASE_SESSION_COOKIE)
+        with open(_SESSION_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _persist_all_sessions(store: dict) -> None:
+    """Write the session store to disk, ignoring errors."""
+    try:
+        with open(_SESSION_FILE, "w", encoding="utf-8") as f:
+            json.dump(store, f)
     except Exception:
         pass
 
 
-def _try_restore_session(cookie_value, api_key):
-    """Try to rebuild auth_user from a stored cookie value by refreshing the ID token.
+def _save_server_session(auth_user: dict) -> None:
+    """Persist auth data server-side and store the session ID in the URL."""
+    store = _load_all_sessions()
+    # Evict sessions older than TTL
+    cutoff = time.time() - _SESSION_TTL_SECONDS
+    store = {k: v for k, v in store.items() if v.get("ts", 0) > cutoff}
 
-    ``cookie_value`` is the raw string stored in the browser cookie (may be None).
-    Returns a valid auth_user dict on success, or None if the cookie is absent
-    or the refresh token has been revoked / expired.
+    session_id = str(uuid.uuid4())
+    store[session_id] = {
+        "rt": auth_user.get("refresh_token", ""),
+        "em": auth_user.get("email", ""),
+        "uid": auth_user.get("local_id", ""),
+        "ts": time.time(),
+    }
+    _persist_all_sessions(store)
+    st.query_params[_SESSION_PARAM] = session_id
+
+
+def _load_server_session() -> dict | None:
+    """Return session data for the current URL session ID, or None."""
+    session_id = st.query_params.get(_SESSION_PARAM)
+    if not session_id:
+        return None
+    store = _load_all_sessions()
+    entry = store.get(session_id)
+    if not entry:
+        return None
+    # Reject expired entries
+    if time.time() - entry.get("ts", 0) > _SESSION_TTL_SECONDS:
+        return None
+    return entry
+
+
+def _delete_server_session() -> None:
+    """Remove the session from disk and clear the URL query param."""
+    session_id = st.query_params.get(_SESSION_PARAM)
+    if session_id:
+        store = _load_all_sessions()
+        store.pop(session_id, None)
+        _persist_all_sessions(store)
+    try:
+        del st.query_params[_SESSION_PARAM]
+    except Exception:
+        pass
+
+
+def _try_restore_session(session_data: dict | None, api_key: str) -> dict | None:
+    """Exchange the stored refresh token for a fresh ID token.
+
+    Returns a valid auth_user dict on success, or None if the session is
+    absent or the refresh token has been revoked / expired.
     """
     try:
-        if not cookie_value:
+        if not session_data:
             return None
-        data = json.loads(cookie_value)
-        refresh_token = data.get("rt", "")
-        email = data.get("em", "")
-        local_id = data.get("uid", "")
+        refresh_token = session_data.get("rt", "")
+        email = session_data.get("em", "")
+        local_id = session_data.get("uid", "")
         if not refresh_token or not email:
             return None
         token_data = refresh_id_token(refresh_token, api_key=api_key)
@@ -823,14 +870,14 @@ def render_dataset_evaluation(dataset_evaluation):
     )
 
 
-def render_sidebar(auth_user=None, cookie_manager=None):
+def render_sidebar(auth_user=None):
     if auth_user:
         st.sidebar.header("Workspace")
         st.sidebar.caption("Review recent analyses, manage your session, and revisit saved work.")
         st.sidebar.success(f"Signed in as {auth_user['email']}")
 
         if st.sidebar.button("Log Out", use_container_width=True):
-            _delete_session_cookie(cookie_manager)
+            _delete_server_session()
             st.session_state.pop(AUTH_USER_SESSION_KEY, None)
             set_session_notice("info", "You have been signed out.")
             st.rerun()
@@ -855,7 +902,7 @@ def render_sidebar(auth_user=None, cookie_manager=None):
     )
 
 
-def render_auth_screen(cookie_manager=None):
+def render_auth_screen():
     st.title("AI Career Intelligence & Job Market Analytics Platform")
     st.caption("Sign in or create a Firebase-backed account to access the analyzer workspace.")
     render_session_notice()
@@ -896,7 +943,7 @@ def render_auth_screen(cookie_manager=None):
                     except FirebaseAuthError as error:
                         st.error(str(error))
                     else:
-                        _save_session_cookie(cookie_manager, auth_user)
+                        _save_server_session(auth_user)
                         set_session_notice("success", "Signed in successfully.")
                         st.rerun()
 
@@ -925,7 +972,7 @@ def render_auth_screen(cookie_manager=None):
                     except FirebaseAuthError as error:
                         st.error(str(error))
                     else:
-                        _save_session_cookie(cookie_manager, auth_user)
+                        _save_server_session(auth_user)
                         set_session_notice("success", "Account created successfully. You are now signed in.")
                         st.rerun()
 
@@ -1298,34 +1345,24 @@ init_history_storage()
 
 
 def main():
-    # Render the cookie component first — it must appear unconditionally so
-    # Streamlit's component bridge can mount it and send cookies back to Python.
-    cookie_manager = _get_cookie_manager()
-
-    # get_all() returns None on the very first render (the browser component
-    # hasn't communicated back yet).  Stop here so Streamlit re-runs once the
-    # component has loaded; on the second render get_all() returns a dict.
-    all_cookies = cookie_manager.get_all()
-    if all_cookies is None:
-        st.stop()
-
     auth_user = get_authenticated_user()
 
-    # If the session was wiped by a page refresh, try to silently restore it
-    # from the refresh token stored in the browser cookie.
+    # If session_state is empty (page refresh), try to restore from the
+    # server-side session store via the session ID in the URL query params.
+    # st.query_params is synchronous and always available — no race conditions.
     if not auth_user:
         api_key = resolve_firebase_api_key(st.secrets)
         if api_key:
-            cookie_value = all_cookies.get(FIREBASE_SESSION_COOKIE)
-            restored = _try_restore_session(cookie_value, api_key)
+            session_data = _load_server_session()
+            restored = _try_restore_session(session_data, api_key)
             if restored:
                 st.session_state[AUTH_USER_SESSION_KEY] = restored
                 auth_user = restored
 
-    render_sidebar(auth_user, cookie_manager)
+    render_sidebar(auth_user)
 
     if not auth_user:
-        render_auth_screen(cookie_manager)
+        render_auth_screen()
         return
 
     render_authenticated_app()
