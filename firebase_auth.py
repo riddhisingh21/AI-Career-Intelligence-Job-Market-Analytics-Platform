@@ -4,6 +4,7 @@ from urllib import error, request
 
 
 FIREBASE_AUTH_BASE_URL = "https://identitytoolkit.googleapis.com/v1"
+FIREBASE_TOKEN_REFRESH_URL = "https://securetoken.googleapis.com/v1/token"
 FIREBASE_ERROR_MESSAGES = {
     "EMAIL_EXISTS": "An account with this email already exists.",
     "EMAIL_NOT_FOUND": "Invalid email or password.",
@@ -32,6 +33,16 @@ def resolve_firebase_api_key(secrets=None):
         os.getenv("FIREBASE_API_KEY")
         or secrets.get("FIREBASE_API_KEY")
         or firebase_secrets.get("api_key")
+    )
+
+
+def resolve_firebase_project_id(secrets=None):
+    secrets = secrets or {}
+    firebase_secrets = secrets.get("firebase") or {}
+    return (
+        os.getenv("FIREBASE_PROJECT_ID")
+        or secrets.get("FIREBASE_PROJECT_ID")
+        or firebase_secrets.get("project_id")
     )
 
 
@@ -173,3 +184,48 @@ def send_password_reset_email(email, api_key=None, secrets=None, http_post=None)
         secrets=secrets,
         http_post=http_post,
     )
+
+
+def refresh_id_token(refresh_token, api_key=None, secrets=None):
+    """Exchange a Firebase refresh token for a fresh ID token.
+
+    Returns a dict with ``id_token``, ``refresh_token``, and ``expires_in``.
+    Raises :class:`FirebaseAuthError` on any failure.
+    """
+    resolved_api_key = api_key or resolve_firebase_api_key(secrets)
+    if not resolved_api_key:
+        raise FirebaseAuthError("FIREBASE_API_KEY is not configured.")
+
+    url = f"{FIREBASE_TOKEN_REFRESH_URL}?key={resolved_api_key}"
+    body = f"grant_type=refresh_token&refresh_token={refresh_token}".encode("utf-8")
+    http_request = request.Request(
+        url,
+        data=body,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+
+    try:
+        with request.urlopen(http_request, timeout=20) as response:
+            response_body = response.read().decode("utf-8")
+        payload = json.loads(response_body) if response_body else {}
+    except error.HTTPError as http_error:
+        raise FirebaseAuthError(_extract_http_error_message(http_error)) from http_error
+    except error.URLError as url_error:
+        raise FirebaseAuthError("Could not reach Firebase Authentication.") from url_error
+
+    id_token = str(payload.get("id_token") or payload.get("access_token") or "").strip()
+    new_refresh_token = str(payload.get("refresh_token") or refresh_token).strip()
+
+    try:
+        expires_in = int(str(payload.get("expires_in", "")).strip())
+    except (TypeError, ValueError):
+        expires_in = None
+
+    if not id_token:
+        raise FirebaseAuthError("Firebase token refresh returned an incomplete response.")
+
+    return {
+        "id_token": id_token,
+        "refresh_token": new_refresh_token,
+        "expires_in": expires_in,
+    }

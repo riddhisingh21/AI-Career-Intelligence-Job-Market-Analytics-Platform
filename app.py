@@ -1,6 +1,9 @@
+import json
 import streamlit as st
 import matplotlib.pyplot as plt
 import plotly.graph_objects as go
+import extra_streamlit_components as stx
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 from analyzer import (
@@ -14,10 +17,17 @@ from dashboard_utils import build_dashboard_snapshot
 from evaluation_utils import REQUIRED_DATASET_COLUMNS, evaluate_dataset_csv_text
 from firebase_auth import (
     FirebaseAuthError,
+    refresh_id_token,
     resolve_firebase_api_key,
+    resolve_firebase_project_id,
     send_password_reset_email,
     sign_in_with_email_password,
     sign_up_with_email_password,
+)
+from firestore_store import (
+    clear_analyses_firestore,
+    get_recent_analyses_firestore,
+    save_analysis_firestore,
 )
 from gemini_analysis import (
     GeminiAnalysisError,
@@ -54,17 +64,90 @@ from suggestions import (
 
 AUTH_USER_SESSION_KEY = "auth_user"
 SESSION_NOTICE_KEY = "session_notice"
+FIREBASE_SESSION_COOKIE = "firebase_session"
 
 
-def render_recent_history(user_email=None):
+# ---------------------------------------------------------------------------
+# Cookie-based session persistence helpers
+# ---------------------------------------------------------------------------
+
+def _get_cookie_manager():
+    """Return the app-wide CookieManager instance (rendered once per run)."""
+    return stx.CookieManager(key="firebase_session_manager")
+
+
+def _save_session_cookie(cookie_manager, auth_user):
+    """Persist the Firebase refresh token + identity info to a 30-day cookie."""
+    payload = json.dumps({
+        "rt": auth_user.get("refresh_token", ""),
+        "em": auth_user.get("email", ""),
+        "uid": auth_user.get("local_id", ""),
+    })
+    expires_at = datetime.now(timezone.utc) + timedelta(days=30)
+    cookie_manager.set(FIREBASE_SESSION_COOKIE, payload, expires_at=expires_at)
+
+
+def _delete_session_cookie(cookie_manager):
+    """Remove the Firebase session cookie (called on sign-out)."""
+    try:
+        cookie_manager.delete(FIREBASE_SESSION_COOKIE)
+    except Exception:
+        pass
+
+
+def _try_restore_session(cookie_value, api_key):
+    """Try to rebuild auth_user from a stored cookie value by refreshing the ID token.
+
+    ``cookie_value`` is the raw string stored in the browser cookie (may be None).
+    Returns a valid auth_user dict on success, or None if the cookie is absent
+    or the refresh token has been revoked / expired.
+    """
+    try:
+        if not cookie_value:
+            return None
+        data = json.loads(cookie_value)
+        refresh_token = data.get("rt", "")
+        email = data.get("em", "")
+        local_id = data.get("uid", "")
+        if not refresh_token or not email:
+            return None
+        token_data = refresh_id_token(refresh_token, api_key=api_key)
+        return {
+            "email": email,
+            "local_id": local_id,
+            "id_token": token_data["id_token"],
+            "refresh_token": token_data["refresh_token"],
+            "expires_in": token_data["expires_in"],
+        }
+    except Exception:
+        return None
+
+
+def render_recent_history(auth_user=None):
     st.sidebar.subheader("Recent Analyses")
-    st.sidebar.caption("Saved locally for this signed-in account on this device.")
 
-    history_items = get_recent_analyses(user_email=user_email)
+    user_id = (auth_user or {}).get("local_id", "")
+    id_token = (auth_user or {}).get("id_token", "")
+    user_email = (auth_user or {}).get("email", "")
+    project_id = resolve_firebase_project_id(st.secrets)
+    use_firestore = bool(project_id and user_id and id_token)
+
+    if use_firestore:
+        st.sidebar.caption("Synced to your Firebase account.")
+        try:
+            history_items = get_recent_analyses_firestore(user_id, id_token, project_id)
+        except Exception:
+            history_items = get_recent_analyses(user_email=user_email)
+    else:
+        st.sidebar.caption("Saved locally for this signed-in account on this device.")
+        history_items = get_recent_analyses(user_email=user_email)
 
     if history_items and st.sidebar.button("Clear History", use_container_width=True):
         try:
-            clear_analysis_history(user_email=user_email)
+            if use_firestore:
+                clear_analyses_firestore(user_id, id_token, project_id)
+            else:
+                clear_analysis_history(user_email=user_email)
             st.sidebar.success("Analysis history cleared.")
             st.rerun()
         except Exception:
@@ -740,19 +823,20 @@ def render_dataset_evaluation(dataset_evaluation):
     )
 
 
-def render_sidebar(auth_user=None):
+def render_sidebar(auth_user=None, cookie_manager=None):
     if auth_user:
         st.sidebar.header("Workspace")
         st.sidebar.caption("Review recent analyses, manage your session, and revisit saved work.")
         st.sidebar.success(f"Signed in as {auth_user['email']}")
 
         if st.sidebar.button("Log Out", use_container_width=True):
+            _delete_session_cookie(cookie_manager)
             st.session_state.pop(AUTH_USER_SESSION_KEY, None)
             set_session_notice("info", "You have been signed out.")
             st.rerun()
 
         st.sidebar.markdown("---")
-        render_recent_history(auth_user["email"])
+        render_recent_history(auth_user)
     else:
         st.sidebar.header("Account Access")
         st.sidebar.caption("Sign in with Firebase email/password authentication to use the analyzer.")
@@ -771,7 +855,7 @@ def render_sidebar(auth_user=None):
     )
 
 
-def render_auth_screen():
+def render_auth_screen(cookie_manager=None):
     st.title("AI Career Intelligence & Job Market Analytics Platform")
     st.caption("Sign in or create a Firebase-backed account to access the analyzer workspace.")
     render_session_notice()
@@ -803,14 +887,16 @@ def render_auth_screen():
                     st.warning("Please enter both your email and password.")
                 else:
                     try:
-                        st.session_state[AUTH_USER_SESSION_KEY] = sign_in_with_email_password(
+                        auth_user = sign_in_with_email_password(
                             sign_in_email,
                             sign_in_password,
                             api_key=firebase_api_key,
                         )
+                        st.session_state[AUTH_USER_SESSION_KEY] = auth_user
                     except FirebaseAuthError as error:
                         st.error(str(error))
                     else:
+                        _save_session_cookie(cookie_manager, auth_user)
                         set_session_notice("success", "Signed in successfully.")
                         st.rerun()
 
@@ -830,14 +916,16 @@ def render_auth_screen():
                     st.error("Password must be at least 6 characters long.")
                 else:
                     try:
-                        st.session_state[AUTH_USER_SESSION_KEY] = sign_up_with_email_password(
+                        auth_user = sign_up_with_email_password(
                             sign_up_email,
                             sign_up_password,
                             api_key=firebase_api_key,
                         )
+                        st.session_state[AUTH_USER_SESSION_KEY] = auth_user
                     except FirebaseAuthError as error:
                         st.error(str(error))
                     else:
+                        _save_session_cookie(cookie_manager, auth_user)
                         set_session_notice("success", "Account created successfully. You are now signed in.")
                         st.rerun()
 
@@ -952,14 +1040,29 @@ def render_authenticated_app():
                 getattr(st, analysis_result["notice_type"])(analysis_result["notice_message"])
 
             try:
-                save_analysis(
-                    resume_name,
-                    score,
-                    interpretation,
-                    matched,
-                    missing,
-                    user_email=auth_user.get("email", ""),
-                )
+                _project_id = resolve_firebase_project_id(st.secrets)
+                _user_id = auth_user.get("local_id", "")
+                _id_token = auth_user.get("id_token", "")
+                if _project_id and _user_id and _id_token:
+                    save_analysis_firestore(
+                        _user_id,
+                        _id_token,
+                        _project_id,
+                        resume_name,
+                        score,
+                        interpretation,
+                        matched,
+                        missing,
+                    )
+                else:
+                    save_analysis(
+                        resume_name,
+                        score,
+                        interpretation,
+                        matched,
+                        missing,
+                        user_email=auth_user.get("email", ""),
+                    )
             except Exception:
                 st.warning("Analysis completed, but history could not be saved.")
 
@@ -1195,11 +1298,34 @@ init_history_storage()
 
 
 def main():
+    # Render the cookie component first — it must appear unconditionally so
+    # Streamlit's component bridge can mount it and send cookies back to Python.
+    cookie_manager = _get_cookie_manager()
+
+    # get_all() returns None on the very first render (the browser component
+    # hasn't communicated back yet).  Stop here so Streamlit re-runs once the
+    # component has loaded; on the second render get_all() returns a dict.
+    all_cookies = cookie_manager.get_all()
+    if all_cookies is None:
+        st.stop()
+
     auth_user = get_authenticated_user()
-    render_sidebar(auth_user)
+
+    # If the session was wiped by a page refresh, try to silently restore it
+    # from the refresh token stored in the browser cookie.
+    if not auth_user:
+        api_key = resolve_firebase_api_key(st.secrets)
+        if api_key:
+            cookie_value = all_cookies.get(FIREBASE_SESSION_COOKIE)
+            restored = _try_restore_session(cookie_value, api_key)
+            if restored:
+                st.session_state[AUTH_USER_SESSION_KEY] = restored
+                auth_user = restored
+
+    render_sidebar(auth_user, cookie_manager)
 
     if not auth_user:
-        render_auth_screen()
+        render_auth_screen(cookie_manager)
         return
 
     render_authenticated_app()
